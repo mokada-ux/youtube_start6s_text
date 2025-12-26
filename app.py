@@ -1,80 +1,113 @@
-# --- 1. 準備 ---
-!wget -q https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml
-import cv2
+import streamlit as st
+import yt_dlp
 import os
-import numpy as np
-from PIL import Image
+from openai import OpenAI
+from pydub import AudioSegment
 
-# --- 2. 設定 ---
-INPUT_IMAGE_FILE = "Image_fx - 2025-11-10T132107.643.jpg"  # 画像ファイル名
+# ページ設定
+st.set_page_config(page_title="YouTube冒頭文字起こしアプリ")
+st.title("🎥 YouTube冒頭6秒 文字起こしツール")
 
-# --- 3. 改良版OpenCVリサイズ関数 ---
-def opencv_smart_resize_v2(image_path, target_width, target_height):
-    if not os.path.exists(image_path):
-        print(f"❌ 画像なし: {image_path}")
-        return
+# サイドバーでAPIキー入力（セキュリティのため）
+api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+if not api_key:
+    st.warning("左側のサイドバーにOpenAI APIキーを入力してください。")
+    st.stop()
 
-    # OpenCVで読み込み
-    img_cv = cv2.imread(image_path)
-    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-    orig_w, orig_h = pil_img.size
-    
-    print(f"\n--- {target_width}x{target_height} 処理開始 (OpenCV V2) ---")
+client = OpenAI(api_key=api_key)
 
-    # 顔認識
-    face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-    
-    center_x, center_y = orig_w / 2, orig_h / 2 # デフォルトは画像の中心
-
-    if len(faces) > 0:
-        print(f"👀 顔を {len(faces)} つ発見。全体の中心を計算します。")
-        # 全ての顔を含むバウンディングボックスを計算
-        min_x = np.min(faces[:, 0])
-        min_y = np.min(faces[:, 1])
-        max_x = np.max(faces[:, 0] + faces[:, 2])
-        max_y = np.max(faces[:, 1] + faces[:, 3])
+# ユーティリティ関数: YouTubeから音声ダウンロード＆6秒カット
+def download_and_cut_audio(url, output_filename="temp_audio"):
+    try:
+        # yt-dlpの設定（最軽量の音声のみ取得）
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': output_filename,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+        }
         
-        # そのボックスの中心点を求める
-        center_x = (min_x + max_x) / 2
-        center_y = (min_y + max_y) / 2
+        # ダウンロード実行
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # pydubで冒頭6秒にカット
+        # yt-dlpは拡張子を自動でつけるため、mp3を探す
+        target_file = output_filename + ".mp3"
+        
+        if not os.path.exists(target_file):
+            return None, "ダウンロードエラー: ファイルが見つかりません"
+
+        audio = AudioSegment.from_mp3(target_file)
+        # ミリ秒単位指定 (6000ms = 6秒)
+        cut_audio = audio[:6000]
+        
+        # 上書き保存
+        cut_audio.export(target_file, format="mp3")
+        return target_file, None
+
+    except Exception as e:
+        return None, str(e)
+
+# ユーティリティ関数: Whisperで文字起こし
+def transcribe_audio(file_path):
+    try:
+        with open(file_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file,
+                language="ja" # 日本語を指定（自動検出も可）
+            )
+        return transcript.text
+    except Exception as e:
+        return f"文字起こしエラー: {str(e)}"
+
+# --- メインUI ---
+
+# URL入力エリア
+urls_input = st.text_area("YouTubeのリンクを1行ずつ入力してください", height=150)
+
+if st.button("文字起こし開始"):
+    if not urls_input:
+        st.error("リンクを入力してください。")
     else:
-        print("👀 顔が見つかりませんでした。画像の中央を使います。")
+        urls = urls_input.strip().split('\n')
+        st.write(f"全 {len(urls)} 件の動画を処理します...")
+        
+        # 進捗バー
+        progress_bar = st.progress(0)
+        
+        results = []
 
-    # --- ここからリサイズ処理 ---
-    # 1. カバー戦略でリサイズ倍率を決定
-    scale = max(target_width / orig_w, target_height / orig_h)
-    resized_w, resized_h = int(orig_w * scale), int(orig_h * scale)
-    img_resized = pil_img.resize((resized_w, resized_h), Image.LANCZOS)
-    
-    # 2. 中心座標もリサイズ後の世界に合わせて計算
-    center_x_scaled = center_x * scale
-    center_y_scaled = center_y * scale
-    
-    # 3. 切り抜く左上の座標を計算
-    left = center_x_scaled - (target_width / 2)
-    top = center_y_scaled - (target_height / 2)
-    
-    # 4. 画像からはみ出さないように補正（クランプ処理）
-    # ここが重要：計算上の中心が端すぎると、強制的に端に寄せられます
-    left = max(0, min(left, resized_w - target_width))
-    top = max(0, min(top, resized_h - target_height))
-    
-    # 5. クロップ実行
-    final_img = img_resized.crop((left, top, left + target_width, top + target_height))
-    
-    save_name = f"cv2_{target_width}x{target_height}.jpg"
-    final_img.save(save_name)
-    print(f"✅ 保存完了: {save_name}")
+        for i, url in enumerate(urls):
+            url = url.strip()
+            if not url: continue
+            
+            with st.spinner(f"処理中 ({i+1}/{len(urls)}): {url}"):
+                # 1. ダウンロード & カット
+                audio_file, error = download_and_cut_audio(url, f"temp_{i}")
+                
+                if error:
+                    st.error(f"{url}: {error}")
+                    results.append({"url": url, "text": "エラー"})
+                else:
+                    # 2. 文字起こし
+                    text = transcribe_audio(audio_file)
+                    st.success(f"完了: {text}")
+                    results.append({"url": url, "text": text})
+                    
+                    # 一時ファイル削除（クリーンアップ）
+                    if os.path.exists(audio_file):
+                        os.remove(audio_file)
 
-# --- 4. 実行 ---
-targets = [
-    (1080, 1080),
-    (1920, 1080),
-    (600, 400)
-]
+            progress_bar.progress((i + 1) / len(urls))
 
-for w, h in targets:
-    opencv_smart_resize_v2(INPUT_IMAGE_FILE, w, h)
+        st.divider()
+        st.subheader("🎉 結果一覧")
+        
+        # 結果をテーブル表示
+        st.table(results)
